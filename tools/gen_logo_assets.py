@@ -8,11 +8,14 @@ Gera firmware/claude_stick/logo_assets.h com:
   img_clawd_sm   — Clawd pixel p/ o header (h=26)
   img_clawd_big  — Clawd p/ telas de token/loading (h=90)
   img_clawd_xl   — Clawd p/ as animações de limiar (w=176)
+  img_or_mark    — simbolo do OpenRouter p/ o header do tile OpenRouter (h=30)
+  img_or_text    — nome "openrouter" (clareado p/ o fundo escuro) ao lado do simbolo (h=22)
   + defines com os retângulos dos olhos do XL (p/ as expressões)
 
 Requisitos: rsvg-convert (brew install librsvg) e Pillow.
 """
 import os
+import re
 import subprocess
 import tempfile
 
@@ -24,8 +27,10 @@ OUT = os.path.join(ROOT, "firmware", "claude_stick", "logo_assets.h")
 
 ICON_SVG = os.path.join(BRAND, "claudecode-color.svg")
 TEXT_SVG = os.path.join(BRAND, "claudecode-text.svg")
+OR_SVG = os.path.join(BRAND, "vertical-grape.svg")  # simbolo roxo + nome em preto
 
 CORAL = "#D97757"
+TEXT = (0xF2, 0xF0, 0xEC)                           # C_TEXT do firmware
 # olhos do Clawd no viewBox 24x24 do claudecode-color.svg (buracos no path)
 EYES_VB = [(6.0, 8.102, 7.488, 10.949), (16.51, 8.102, 18.0, 10.949)]
 VB = 24.0
@@ -131,6 +136,24 @@ def main() -> None:
         parts.append(f"#define CLAWD_XL_EYE{i}_W {w}")
         parts.append(f"#define CLAWD_XL_EYE{i}_H {h}")
     parts.append("")
+
+    # Logo vertical nao cabe no header de 36px: simbolo e nome viram 2 imagens
+    # (paths roxos = simbolo; o resto = nome, clareado p/ C_TEXT).
+    svg = open(OR_SVG, encoding="utf-8").read()
+    head = svg[:svg.index(">") + 1]
+    paths = re.findall(r"<path[\s\S]*?/>", svg)
+    text_hex = "#%02X%02X%02X" % TEXT
+    for name, keep, h in (("img_or_mark", True, 30), ("img_or_text", False, 22)):
+        sel = [p for p in paths if ("#7624F4" in p) == keep]
+        part = head + "".join(sel).replace("#03080A", text_hex) + "</svg>"
+        with tempfile.NamedTemporaryFile(suffix=".svg", delete=False, mode="w") as tf:
+            tf.write(part)
+        im = render(tf.name, height=400)
+        os.unlink(tf.name)
+        im = im.crop(im.getbbox())
+        im = im.resize((round(im.width * h / im.height), h), Image.LANCZOS)
+        parts.append(to_c(im, name))
+        print(f"{name}: {im.size}")
 
     with open(OUT, "w") as f:
         f.write("\n".join(parts))

@@ -147,3 +147,54 @@ bool fetchUsage(const char* token, UsageData& out) {
     out.ok = true;
     return true;
 }
+
+// Corpo: {"data":{"total_credits":100.5,"total_usage":25.75}}. Pequeno e fixo,
+// strstr+strtod basta (sem lib JSON no projeto).
+static bool jnum(const String& s, const char* key, float& out) {
+    int i = s.indexOf(key);
+    if (i < 0) return false;
+    const char* p = s.c_str() + i + strlen(key);
+    while (*p == ' ' || *p == ':') p++;
+    char* end;
+    double v = strtod(p, &end);
+    if (end == p) return false;
+    out = (float)v;
+    return true;
+}
+
+bool fetchOpenRouter(const char* key, OrData& out) {
+    out.ok = false;
+    if (WiFi.status() != WL_CONNECTED) { strlcpy(out.error, "sem wifi", sizeof(out.error)); return false; }
+
+    // Socket vivo e do api.anthropic.com: com setReuse o HTTPClient o reaproveitaria
+    // para outro host. Fecha antes; o apiClose() do ciclo fecharia de todo jeito.
+    g_api.end();
+    apiClient().stop();
+
+    int code = HTTPC_ERROR_CONNECTION_REFUSED;
+    for (int attempt = 0; attempt < 2 && code <= 0; attempt++) {
+        if (attempt == 1) { apiClient().stop(); delay(150); }
+        if (!g_api.begin(apiClient(), OR_CREDITS_ENDPOINT)) continue;
+        g_api.setReuse(true);
+        g_api.addHeader("Authorization", String("Bearer ") + key);
+        g_api.addHeader("User-Agent", "claude-usage-stick/" FW_VERSION);
+        g_api.setTimeout(API_TIMEOUT_MS);
+        code = g_api.GET();
+        if (code <= 0) g_api.end();
+    }
+    Serial.printf("[API] GET %s -> HTTP %d\n", OR_CREDITS_ENDPOINT, code);
+    if (code <= 0) { snprintf(out.error, sizeof(out.error), "http_%d", code); return false; }
+
+    String body = g_api.getString();
+    g_api.end();
+    if (code == 403) { strlcpy(out.error, "precisa management key", sizeof(out.error)); return false; }
+    if (code == 401) { strlcpy(out.error, "auth_failed", sizeof(out.error)); return false; }
+    if (code != 200 || !jnum(body, "\"total_credits\"", out.credits) ||
+        !jnum(body, "\"total_usage\"", out.used)) {
+        snprintf(out.error, sizeof(out.error), "or_http_%d", code);
+        return false;
+    }
+    Serial.printf("[API] OR credits=%.2f used=%.2f\n", out.credits, out.used);
+    out.ok = true;
+    return true;
+}

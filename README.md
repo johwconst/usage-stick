@@ -9,7 +9,7 @@ No computer. No app. No cloud.
 
 **English** · [Português](README.pt-BR.md)
 
-<img src="https://img.shields.io/badge/firmware-v2.4-D97757?style=for-the-badge" alt="firmware v2.4">
+<img src="https://img.shields.io/badge/firmware-v2.5-D97757?style=for-the-badge" alt="firmware v2.5">
 <img src="https://img.shields.io/badge/ESP32--S3-AXS15231B%20480×320-1A1A20?style=for-the-badge" alt="ESP32-S3 AXS15231B">
 <img src="https://img.shields.io/badge/LVGL-9.2.2-4ADE80?style=for-the-badge" alt="LVGL 9.2.2">
 <img src="https://img.shields.io/badge/accounts-up%20to%204-8C8C98?style=for-the-badge" alt="up to 4 accounts">
@@ -19,8 +19,9 @@ No computer. No app. No cloud.
 </div>
 
 The device queries Anthropic's API directly, reads your usage straight from the response headers,
-and renders it on a dashboard — animated **Clawd** mascots, a burn-rate projection, an hour-of-day
-heatmap, reset clocks, and **up to 4 accounts** you can switch between on-screen.
+and renders it on a dashboard — animated **Clawd** mascots, reset clocks, and **up to 4 accounts**
+you can switch between on-screen. Optionally it also shows your **OpenRouter** credit balance and
+spend on a second screen.
 
 > 100% touch navigation (swipe ← → between screens, no physical button). Adapted from the original
 > **Claude Usage Stick** project (a multi-board firmware with physical buttons) to run **on this
@@ -64,8 +65,9 @@ If you're comfortable with a terminal, skip it and use [Build & flash](#build--f
 
 > The images below are **pixel-accurate mockups** rendered from the firmware's own layout and
 > palette (real device photos coming soon). They
-> match v2.4, except that the three swipe screens do not show the `@label` account badge that
-> appears in the header once you add a second account.
+> match v2.4, except that the swipe screens do not show the `@label` account badge that
+> appears in the header once you add a second account. The 5-hour window and hourly rhythm screens
+> were removed in v2.5.
 
 Navigate by **swiping** (the dots at the bottom show your position; the active one becomes a
 pill). The **gear** opens Settings. The thin **coral bar** below the header counts down to the
@@ -84,23 +86,21 @@ next refresh — tapping it refreshes immediately.
 
 <br clear="right">
 
-### 2. 5-hour window (*Janela de 5h*)
-<img src="assets/mock-janela5h.png" width="400" align="right" alt="5-hour window screen">
+### 2. OpenRouter (optional)
 
-- Custom chart with the **X axis spanning exactly the current 5 h window** (start → reset).
-- Solid coral line = real usage history; **dotted line = projection** at the current burn rate.
-- Plain-language verdict, color-coded: *"At the current rate, runs out at 16:40 (in 1h32m)"*
-  (amber/red) or *"Does NOT run out before the reset (~62%)"* (green).
+Shows up as a second swipe screen once you connect an OpenRouter key (Settings → **OpenRouter**).
+When it is the visible screen, the header swaps the Clawd + wordmark for the OpenRouter logo.
 
-<br clear="right">
+- **Balance** card: account balance (`total_credits - total_usage`) with the same segmented meter,
+  colored by how much of the purchased credit is already spent, plus the % left.
+- **Spent today** and **total spent**. "Today" is derived on the device: the total at the first
+  poll of the local day is the baseline, so the first day only counts from when the key was added.
+- Status chip: `OK` / `SALDO BAIXO` (≥ 90 % spent) / `SEM SALDO` / `ERRO`.
 
-### 3. Hourly rhythm (*Ritmo por hora*)
-<img src="assets/mock-ritmo.png" width="400" align="right" alt="Hourly rhythm screen">
-
-- **Usage by hour of day**: 24 bars whose height/brightness show which hours burn the most quota;
-  the current hour is highlighted.
-- **Period selector** at the top: **Hoje / 7d / 30d / Tudo** (today, last 7 days, last 30 days,
-  all time). Per-day history is **persisted to flash** (31 days on the device).
+The device calls `GET https://openrouter.ai/api/v1/credits`, which only accepts a **management
+key** (create one at `openrouter.ai/settings/management-keys`); a regular inference key is rejected
+with a clear error. The key is encrypted with the same PIN as the Claude token, and is polled in the
+same refresh cycle. Tap the row twice to remove it.
 
 <br clear="right">
 
@@ -135,6 +135,8 @@ Opened from the gear (scrollable list, 44 px touch rows):
 - **Accounts** — up to 4 Claude accounts (e.g. personal + work); tap a slot to switch which one
   the device monitors, add via the web form (with a custom label), rename on-screen (pencil),
   remove with 2 taps.
+- **OpenRouter** — connect a management key via the web form (adds the OpenRouter screen); when
+  connected, 2 taps remove it.
 - **Change token** — reopens the web token entry (replaces the active account's token).
 - **Language** — Portuguese / English, applied to the whole UI (saved to NVS).
 - **About** — device info, display model and developer credits.
@@ -147,7 +149,7 @@ Got a personal **and** a work Claude subscription? The device holds **up to 4**,
 label and its own encrypted slot, all behind the same PIN.
 
 - **Tap a row to switch.** The active one is coral and marked *ativa*. Switching swaps the token
-  and that account's history/heatmap, then refreshes immediately — no PIN prompt, the session
+  and refreshes immediately — no PIN prompt, the session
   already unlocked it.
 - **Only the active account is polled.** The others are completely dormant: **zero API requests**.
   That matters for a corporate account, where every poll is visible to your org's admins.
@@ -306,8 +308,7 @@ python3 tools/token_bridge.py --account Pessoal --loop 120    # personal machine
 The device stores up to **4 accounts** (label + token), each encrypted in its own NVS slot with
 the same PIN. Only the **active** account is polled — the others stay dormant, generating **zero
 API traffic**. Switching (Settings → Accounts) takes two taps: the device decrypts the slot,
-swaps the per-account history/heatmap (`/hist0.bin`..`/hist3.bin` in LittleFS) and refreshes
-immediately. The dashboard header shows an `@label` badge whenever more than one account exists.
+and refreshes immediately. The dashboard header shows an `@label` badge whenever more than one account exists.
 
 Heads-up for corporate accounts: every poll is a real (minimal) API request, visible to your org's
 admins like any Claude Code usage.
@@ -454,7 +455,6 @@ PIN — no PIN prompt again during the session.
   the GCM tag fails to verify.
 - After 10 wrong attempts, the credentials are **wiped** and the device returns to onboarding
   (each failure doubles the lockout time).
-- The history/heatmap lives in a **LittleFS** file, one per account (it does not contain the token).
 - The PIN stays in RAM for the session so switching accounts does not prompt again. This does not
   weaken the model: the active token is already held decrypted in RAM either way. Nothing is
   written to NVS, and a factory reset clears it.

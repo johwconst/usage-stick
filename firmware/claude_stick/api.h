@@ -28,3 +28,14 @@ bool fetchUsage(const char* token, UsageData& out);
 // contexto mbedTLS segura ~40KB de heap, e deixar isso vivo entre polls aperta
 // a heap que o driver WiFi tambem usa.
 void apiClose();
+
+// Saldo da conta OpenRouter (GET /api/v1/credits). Exige management key:
+// chave de inferencia comum leva 403.
+struct OrData {
+    float credits;               // total comprado (US$)
+    float used;                  // total gasto (US$)
+    bool  ok;
+    char  error[64];
+};
+
+bool fetchOpenRouter(const char* key, OrData& out);

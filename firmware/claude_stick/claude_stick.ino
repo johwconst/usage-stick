@@ -79,6 +79,15 @@ struct TokenStats { long long tin, tout, cache; int sessions; uint32_t atMs; };
 static TokenStats g_tok = {0, 0, 0, 0, 0};
 #define TOK_FRESH_MS (15UL * 60UL * 1000UL)
 
+// ---- OpenRouter (opcional; management key cifrada com o PIN da sessao) ----
+static EncryptedBlob g_orBlob;
+static bool  g_hasOr = false;            // blob salvo no NVS ("orblob")
+static char  g_orKey[128] = {0};         // chave decifrada (so RAM)
+static OrData g_or = {};
+static float g_orBase = -1.0f;           // total_usage no 1o poll do dia local
+static uint32_t g_orDay = 0;             // dia (day_key) de g_orBase
+static bool  g_orEntry = false;          // tela de token esta pedindo a chave OR
+
 // ---- Token / segurança ----
 static AccountSlots g_accts;
 static EncryptedBlob g_blob;
@@ -134,24 +143,8 @@ static int g_weekMasc = 1;                // card SEMANA: 0=off 1=Clawd 2=rodizi
 static bool g_weekFlip = false;           // face atual do card SEMANA (vira a cada poll)
 static int g_rotIdx = 0;                  // proximo modelo do rodizio
 static int g_slideSec = 0;                // slideshow: 0=off, 5/10/15/30s (config, NVS)
-static int g_heatMode = 3;                // 0=hoje 1=7d 2=30d 3=tudo (config, NVS)
 static uint32_t g_lastTouchMs = 0;        // ultimo toque (pausa o slideshow)
 static uint32_t g_lastSlideMs = 0;
-
-// ---- Histórico (ring buffer; persistido em LittleFS) ----
-#define HIST_MAX 160
-struct Sample { uint32_t t; uint8_t h5; uint8_t d7; };   // t = epoch (0 = relógio não sincronizado)
-static Sample g_hist[HIST_MAX];
-static int g_histN = 0;
-static int g_histHead = 0;
-static float g_hourBurn[24] = {0};   // consumo por hora do dia (todo o tempo)
-static float g_lastH5 = -1.0f;       // última utilização 5h (delta do heatmap)
-
-// ---- Heatmap por dia (para o filtro hoje/7d/30d) ----
-#define NDAYS 31
-struct DayHeat { uint32_t day; float burn[24]; };   // day = dias locais desde epoch
-static DayHeat g_days[NDAYS];
-static int g_dayN = 0;
 
 // ---- Mascotes Clawd oficiais por modelo (reservado p/ uso futuro) ----
 // Sem tela propria hoje: g_mascN fica 0 e a animacao do loop() nao roda.
@@ -177,7 +170,7 @@ static int g_mascN = 0;
 static lv_point_precise_t g_mXPts[NMODELS][4][2];   // olhos em X (mood 3)
 
 // ---- Ponteiros de UI do dashboard (zerados a cada build de ST_MAIN) ----
-#define NTILES 3
+#define NTILES 2                      // 0 = Claude, 1 = OpenRouter (so com chave)
 #define NSEG 18                       // segmentos do medidor de janela
 struct DashUI {
   lv_obj_t *tv, *tile[NTILES], *dots[NTILES];
@@ -187,18 +180,16 @@ struct DashUI {
   lv_obj_t *agPct7, *agCd7, *agAt7, *agTok;
   lv_obj_t *seg5[NSEG], *seg7[NSEG];  // medidores segmentados
   lv_obj_t *wkMasc;                   // face "mascote" do card SEMANA
-  // tendência da janela 5h (linhas custom)
-  lv_obj_t *trHist, *trProj, *trDot, *trCap, *trT0, *trT1;
-  // ritmo por hora
-  lv_obj_t *heat[24], *heatBtn[4];
+  // OpenRouter
+  lv_obj_t *orBal, *orAt, *orFree, *orToday, *orUsed, *orChip, *orMsg;
+  lv_obj_t *orSeg[NSEG];
+  // header: troca Claude <-> OpenRouter conforme o tile
+  lv_obj_t *hIcon, *hWord, *hOrName, *hAcct;
 };
 static DashUI g_ui;
 static lv_obj_t *g_pinDots = nullptr, *g_pinMsg = nullptr;
 static int g_curTile = 0;
 
-// pontos das linhas do gráfico de tendência (precisam persistir)
-static lv_point_precise_t g_trPts[HIST_MAX];
-static lv_point_precise_t g_trProjPts[2];
 
 // ---- Forward declarations ----
 static void render_state();
@@ -220,10 +211,11 @@ static void ui_account_name();
 static void ui_message(const char *title, const char *sub, uint32_t color);
 static void nav_cb(lv_event_t *e);
 static void start_data_web();
-static void trend_redraw();
-static void heat_redraw();
 static void update_tok_row();
 static void show_moment(int win, int thr);
+static void or_apply(const OrData &d);
+static bool or_save(const char *key, OrData &d);
+static void or_remove();
 static void moment_tick();
 static void moment_close();
 
@@ -447,9 +439,10 @@ static void load_persisted() {
   if (g_weekMasc < 0 || g_weekMasc > 3) g_weekMasc = 1;
   if (g_slideSec != 0 && g_slideSec != 5 && g_slideSec != 10 &&
       g_slideSec != 15 && g_slideSec != 30) g_slideSec = 0;
-  g_heatMode = g_prefs.getInt("heatm", 3);
-  if (g_heatMode < 0 || g_heatMode > 3) g_heatMode = 3;
   g_lang = g_prefs.getInt("lang", 0) ? 1 : 0;
+  g_hasOr = g_prefs.getBytes("orblob", &g_orBlob, sizeof(g_orBlob)) == sizeof(g_orBlob);
+  g_orDay = g_prefs.getUInt("ordk", 0);
+  g_orBase = g_prefs.getFloat("orbase", -1.0f);
 }
 static void save_attempts() { g_prefs.putInt("pinatt", g_pinAttempts); }
 // Noite so vale com relogio sincronizado. from == to = janela vazia.
@@ -471,23 +464,18 @@ static uint8_t backlight_target() {
 }
 static void apply_brightness() { g_blNow = backlight_target(); ledcWrite(TFT_BL, g_blNow); }
 
-static void reset_history_ram();
-
 static void factory_reset() {
   g_prefs.clear();              // apaga blob, pinatt, bri do namespace claude
   g_wifi.forgetAll();
-  for (int i = 0; i < ACCT_MAX; i++) {
-    char pth[16]; snprintf(pth, sizeof(pth), "/hist%d.bin", i);
-    LittleFS.remove(pth);
-  }
   memset(&g_accts, 0, sizeof(g_accts));
   memset(g_sessionPin, 0, sizeof(g_sessionPin));
   g_pendingLabel[0] = 0;
   g_tokenTargetSlot = 0;
-  reset_history_ram();
   memset(&g_tok, 0, sizeof(g_tok));
   g_hasToken = false;
   g_token[0] = 0; g_pendingToken[0] = 0;
+  g_hasOr = false; memset(g_orKey, 0, sizeof(g_orKey)); memset(&g_or, 0, sizeof(g_or));
+  g_orBase = -1.0f; g_orDay = 0;
   g_pinAttempts = 0;
   g_lockoutUntil = 0;                        // senao contamina a tela de setup
   g_onboarding = true;
@@ -935,6 +923,16 @@ static lv_obj_t *build_claude_mark(lv_obj_t *parent) {
   "<line x1=34 y1=11 x2=66 y2=89/><line x1=66 y1=11 x2=34 y2=89/></g></svg>"
 
 static String web_form() {
+  if (g_orEntry) return F("<!doctype html><html lang=pt><head><meta charset=utf-8>"
+               "<meta name=viewport content='width=device-width,initial-scale=1'>"
+               "<title>Claude Usage Stick</title><style>" WEB_CSS "</style></head><body><div class=card>"
+               "<h1>OpenRouter</h1>"
+               "<p>Cole uma <b>management key</b> do OpenRouter (<code>sk-or-v1-...</code>), criada em "
+               "<code>openrouter.ai/settings/management-keys</code>. So ela le o saldo da conta; "
+               "a chave comum de API e recusada. Fica cifrada com o seu PIN.</p>"
+               "<form method=POST action='/token'>"
+               "<textarea name=token placeholder='sk-or-v1-...' autocomplete=off autofocus></textarea>"
+               "<button type=submit>Salvar e validar</button></form></div></body></html>");
   String h = F("<!doctype html><html lang=pt><head><meta charset=utf-8>"
                "<meta name=viewport content='width=device-width,initial-scale=1'>"
                "<title>Claude Usage Stick</title><style>" WEB_CSS "</style></head><body><div class=card>"
@@ -951,7 +949,10 @@ static String web_result(bool ok, const String &msg) {
   String h = F("<!doctype html><html lang=pt><head><meta charset=utf-8>"
                "<meta name=viewport content='width=device-width,initial-scale=1'>"
                "<title>Claude Usage Stick</title><style>" WEB_CSS "</style></head><body><div class=card>");
-  if (ok) {
+  if (ok && g_orEntry) {
+    h += F("<h1>OpenRouter conectado</h1><p>Chave aceita. O saldo aparece no dashboard, "
+           "deslizando para o lado. Pode fechar esta pagina.</p>");
+  } else if (ok) {
     h += F("<h1>" WEB_SPARK " Token validado</h1>"
            "<p>Token aceito pela API. Agora <b>defina um PIN de 4 dígitos</b> na tela do gadget para finalizar. "
            "Pode fechar esta página.</p>");
@@ -980,6 +981,17 @@ static void handleTokenPost() {
   }
   // feedback no device antes da chamada bloqueante
   if (g_tokMsg) { lv_label_set_text(g_tokMsg, TRS("validando token...", "validating token...")); lv_refr_now(NULL); }
+
+  if (g_orEntry) {
+    OrData d = {};
+    bool ok = or_save(t.c_str(), d);
+    if (ok) g_tokenGot = true;                  // loop -> ST_MAIN
+    if (g_tokMsg) lv_label_set_text(g_tokMsg, ok ? TRS("OpenRouter conectado!", "OpenRouter connected!")
+                                                 : TRS("chave recusada, tente de novo", "key rejected, try again"));
+    g_web->send(200, "text/html; charset=utf-8",
+                web_result(ok, String("O OpenRouter recusou a chave (") + d.error + "). Confira e cole de novo."));
+    return;
+  }
 
   UsageData tmp = {};
   bool ok = fetchUsage(t.c_str(), tmp);
@@ -1057,12 +1069,11 @@ main{max-width:760px;margin:auto}h1{font-size:20px;margin:0 0 4px}.sub{color:var
 .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.card{background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:18px;margin-bottom:12px}
 .lbl{color:var(--mut);font-size:12px;letter-spacing:.08em}.pct{font-size:44px;font-weight:700;margin:4px 0}
 .bar{height:8px;background:#26262E;border-radius:4px;overflow:hidden}.bar i{display:block;height:100%}
-.cd{color:var(--mut);font-size:13px;margin-top:8px}svg{width:100%;height:180px}
+.cd{color:var(--mut);font-size:13px;margin-top:8px}
 label{display:block;color:var(--mut);font-size:13px;margin:10px 0 4px}select{width:100%;background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:10px;padding:10px}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:0 12px}button{margin-top:14px;width:100%;background:var(--cor);color:#1A1A20;border:0;border-radius:10px;padding:12px;font-weight:700;font-size:15px}
 #msg{color:var(--mut);font-size:13px;margin-top:8px;min-height:1em}input[type=file]{width:100%;color:var(--mut);font-size:13px;margin-top:10px}
 #otab{height:8px;background:#26262E;border-radius:4px;overflow:hidden;margin-top:12px;display:none}#otab i{display:block;height:100%;width:0;background:var(--cor)}
-.leg{font-size:12px;color:var(--mut)}.leg b{display:inline-block;width:10px;height:3px;margin:0 4px 2px 10px}
 @media(max-width:560px){.row,.grid{grid-template-columns:1fr}}
 </style></head><body><main>
 <h1>Claude Usage Stick</h1><div class=sub id=sub>carregando...</div>
@@ -1070,8 +1081,7 @@ label{display:block;color:var(--mut);font-size:13px;margin:10px 0 4px}select{wid
 <div class=card><div class=lbl>5 HORAS</div><div class=pct id=p5>--</div><div class=bar><i id=b5></i></div><div class=cd id=c5></div></div>
 <div class=card><div class=lbl>SEMANA</div><div class=pct id=p7>--</div><div class=bar><i id=b7></i></div><div class=cd id=c7></div></div>
 </div>
-<div class=card><div class=lbl>HISTORICO</div><span class=leg><b style="background:var(--cor)"></b>5h<b style="background:#7DD3FC"></b>semana</span>
-<svg id=ch viewBox="0 0 700 180" preserveAspectRatio=none></svg></div>
+<div class=card id=orc style="display:none"><div class=lbl>OPENROUTER • SALDO</div><div class=pct id=orb>--</div><div class=bar><i id=orbar></i></div><div class=cd id=ord></div></div>
 <form class=card id=f><div class=lbl>AJUSTES</div><div class=grid>
 <div><label>Intervalo de atualizacao</label><select name=poll><option value=15>15 s<option value=30>30 s<option value=60>1 min<option value=120>2 min<option value=300>5 min</select></div>
 <div><label>Brilho</label><select name=bri><option value=0>baixo<option value=1>medio<option value=2>alto</select></div>
@@ -1084,6 +1094,10 @@ label{display:block;color:var(--mut);font-size:13px;margin:10px 0 4px}select{wid
 <div><label>Noite: de</label><select name=nfrom id=nfrom></select></div>
 <div><label>Noite: ate</label><select name=nto id=nto></select></div>
 </div><button>Salvar</button><div id=msg></div></form>
+<div class=card><div class=lbl>OPENROUTER</div><div class=cd id=orst></div>
+<input type=password id=ork placeholder="management key: sk-or-v1-..." autocomplete=off style="width:100%;background:var(--bg);color:var(--tx);border:1px solid var(--bd);border-radius:10px;padding:10px;margin-top:10px">
+<div class=grid><button id=orsave type=button>Conectar</button><button id=ordel type=button style="background:#24242C;color:#F2F0EC">Remover</button></div>
+<div id=ormsg class=cd>Crie a chave em openrouter.ai/settings/management-keys (a chave comum de API nao le o saldo).</div></div>
 <div class=card><div class=lbl>LOGO DO HEADER</div><div class=cd id=lgst></div>
 <canvas id=lgc width=0 height=0 style="background:#0F0F12;border-radius:6px;margin-top:10px;max-width:100%"></canvas>
 <input type=file id=lgf accept="image/png,image/svg+xml,image/jpeg,image/webp"><div class=grid>
@@ -1100,13 +1114,13 @@ const col=p=>p>=90?'var(--bad)':p>=70?'var(--warn)':'var(--ok)';
 function cd(ep,now){if(!ep||!now)return'';let s=ep-now;if(s<=0)return'resetando...';const d=Math.floor(s/86400),h=Math.floor(s%86400/3600),m=Math.floor(s%3600/60);
 const t=new Date(ep*1000).toLocaleString('pt-BR',{weekday:'short',hour:'2-digit',minute:'2-digit'});return'reseta em '+(d?d+'d ':'')+h+'h'+String(m).padStart(2,'0')+' ('+t+')'}
 function card(k,p,ep,now){$('p'+k).textContent=Math.round(p)+'%';$('p'+k).style.color=col(p);$('b'+k).style.width=Math.min(100,p)+'%';$('b'+k).style.background=col(p);$('c'+k).textContent=cd(ep,now)}
-function chart(h){const W=700,H=180;let g='';for(const y of[25,50,75])g+=`<line x1=0 x2=${W} y1=${H-y*H/100} y2=${H-y*H/100} stroke=#26262E />`;
-if(h.length>1){const pts=k=>h.map((r,i)=>(i*W/(h.length-1)).toFixed(1)+','+(H-r[k]*H/100).toFixed(1)).join(' ');
-g+=`<polyline points="${pts(2)}" fill=none stroke=#7DD3FC stroke-width=2 /><polyline points="${pts(1)}" fill=none stroke=#D97757 stroke-width=2.5 />`}
-else g+=`<text x=12 y=24 fill=#8C8C98 font-size=14>sem historico ainda</text>`;$('ch').innerHTML=g}
+function orc(o){$('orc').style.display=o?'block':'none';if(!o)return;const bal=o.credits-o.used,u=o.credits>0?Math.min(100,o.used*100/o.credits):100;
+$('orb').textContent='$'+bal.toFixed(2);$('orb').style.color=col(u);$('orbar').style.width=(100-u)+'%';$('orbar').style.background=col(u);
+$('ord').textContent=o.ok?`hoje $${o.today.toFixed(2)} • total gasto $${o.used.toFixed(2)} de $${o.credits.toFixed(2)}`:'erro: '+o.error}
 let loaded=false;
 async function load(){try{const r=await fetch('/api/state');const j=await r.json();
-card(5,j.h5,j.h5_reset,j.now);card(7,j.d7,j.d7_reset,j.now);chart(j.hist);
+card(5,j.h5,j.h5_reset,j.now);card(7,j.d7,j.d7_reset,j.now);orc(j.or);
+$('orst').textContent=j.or?'Conectado. Saldo aparece no card acima e na 2a tela do device.':'Desconectado.';
 const age=j.last_ok_s<0?'nunca':j.last_ok_s<60?j.last_ok_s+'s':Math.round(j.last_ok_s/60)+'min';
 $('sub').textContent=`@${j.account} \u2022 ${j.status||'-'} \u2022 atualizado ha ${age}`+(j.fetch_ok?'':' \u2022 ultima atualizacao FALHOU')+` \u2022 v${j.fw}`;
 if(!loaded){for(const k of['poll','bri','tz','slide','wmasc','lang','dim','night','nfrom','nto'])$('f')[k].value=j.cfg[k];loaded=true}
@@ -1133,6 +1147,10 @@ catch(e){$('lgmsg').textContent='nao consegui ler a imagem'}};
 $('lgup').onclick=async()=>{if(!lg){$('lgmsg').textContent='escolha uma imagem';return}
 const fd=new FormData();fd.append('logo',new Blob([lg.b]),'logo.raw');$('lgmsg').textContent='enviando...';
 const r=await fetch(`/api/logo?w=${lg.w}&h=${lg.h}`,{method:'POST',body:fd});$('lgmsg').textContent=r.ok?'logo aplicada':'erro: '+await r.text();load()};
+$('orsave').onclick=async()=>{const k=$('ork').value.trim();if(!k){$('ormsg').textContent='cole a chave';return}
+$('ormsg').textContent='validando...';const r=await fetch('/api/openrouter',{method:'POST',body:new URLSearchParams({key:k})});
+$('ormsg').textContent=r.ok?'conectado':'erro: '+await r.text();if(r.ok)$('ork').value='';load()};
+$('ordel').onclick=async()=>{const r=await fetch('/api/openrouter/delete',{method:'POST'});$('ormsg').textContent=r.ok?'removido':'erro';load()};
 $('lgdel').onclick=async()=>{const r=await fetch('/api/logo/delete',{method:'POST'});$('lgmsg').textContent=r.ok?'logo removida':'erro';load()};
 function waitBack(){$('otamsg').textContent='reiniciando... aguardando o device voltar';
 const t=setInterval(async()=>{try{const r=await fetch('/api/state',{cache:'no-store'});if(r.ok){clearInterval(t);location.reload()}}catch(e){}},2000)}
@@ -1205,11 +1223,27 @@ static void handleLogoDelete() {
   logo_redraw();
 }
 
+// OpenRouter pelo painel: mesma validacao/cifra da tela de Ajustes.
+static void handleOrPost() {
+  String k = g_web->arg("key");
+  k.trim();
+  OrData d = {};
+  if (k.length() < 8) { g_web->send(400, "text/plain", "chave vazia"); return; }
+  if (!or_save(k.c_str(), d)) { g_web->send(400, "text/plain", d.error); return; }
+  g_web->send(200, "text/plain", "ok");
+  if (g_state == ST_MAIN || g_state == ST_SETTINGS) request_state(g_state);   // 2o tile / linha
+}
+static void handleOrDelete() {
+  or_remove();
+  g_web->send(200, "text/plain", "ok");
+  if (g_state == ST_MAIN || g_state == ST_SETTINGS) request_state(g_state);
+}
+
 static void handlePanel() { g_web->send_P(200, "text/html; charset=utf-8", PANEL_PAGE); }
 
 static void handleState() {
   String j;
-  j.reserve(700 + g_histN * 22);
+  j.reserve(800);
   char b[512];
   long lastOk = g_lastOkMs ? (long)((millis() - g_lastOkMs) / 1000) : -1;
   snprintf(b, sizeof(b),
@@ -1217,7 +1251,7 @@ static void handleState() {
            "\"status\":\"%s\",\"fetch_ok\":%s,\"last_ok_s\":%ld,\"account\":\"%s\",\"fw\":\"" FW_VERSION "\","
            "\"ota_s\":%lu,\"logo\":\"%s\","
            "\"cfg\":{\"poll\":%d,\"bri\":%d,\"tz\":%d,\"slide\":%d,\"wmasc\":%d,\"lang\":%d,"
-           "\"dim\":%d,\"night\":%d,\"nfrom\":%d,\"nto\":%d},\"hist\":[",
+           "\"dim\":%d,\"night\":%d,\"nfrom\":%d,\"nto\":%d}",
            (unsigned long)time(nullptr), g_usage.h5, g_usage.d7,
            (unsigned long)g_usage.h5ResetEpoch, (unsigned long)g_usage.d7ResetEpoch,
            g_usage.statusOverall, g_lastFetchOk ? "true" : "false", lastOk,
@@ -1227,12 +1261,12 @@ static void handleState() {
            g_pollSec, g_briIdx, g_tzOffset, g_slideSec, g_weekMasc, (int)g_lang,
            g_dimMin, g_nightOn ? 1 : 0, g_nightFrom, g_nightTo);
   j += b;
-  for (int i = 0; i < g_histN; i++) {
-    const Sample &sm = g_hist[hist_idx(i)];
-    snprintf(b, sizeof(b), "%s[%lu,%u,%u]", i ? "," : "", (unsigned long)sm.t, sm.h5, sm.d7);
+  if (g_hasOr) {
+    snprintf(b, sizeof(b), ",\"or\":{\"ok\":%s,\"credits\":%.4f,\"used\":%.4f,\"today\":%.4f,\"error\":\"%s\"}",
+             g_or.ok ? "true" : "false", g_or.credits, g_or.used, or_today(), g_or.error);
     j += b;
   }
-  j += "]}";
+  j += "}";
   g_web->send(200, "application/json", j);
 }
 
@@ -1308,6 +1342,8 @@ static void start_data_web() {
   g_web->on("/api/settings", HTTP_POST, handleSettingsPost);
   g_web->on("/api/logo", HTTP_POST, handleLogoDone, handleLogoUpload);
   g_web->on("/api/logo/delete", HTTP_POST, handleLogoDelete);
+  g_web->on("/api/openrouter", HTTP_POST, handleOrPost);
+  g_web->on("/api/openrouter/delete", HTTP_POST, handleOrDelete);
   g_web->on("/window", HTTP_GET, handleWindow);
   g_web->on("/tokens", HTTP_POST, handleTokensPost);
   g_web->on("/update", HTTP_GET, handleUpdatePage);
@@ -1327,11 +1363,19 @@ static void ui_token() {
     lv_obj_add_event_cb(bk, nav_cb, LV_EVENT_CLICKED, (void *)(intptr_t)(g_usage.ok ? ST_MAIN : ST_SETTINGS));
   }
 
-  lv_obj_t *mark = build_claude_mark(scr);
-  lv_obj_align(mark, LV_ALIGN_TOP_MID, 0, 8);
+  if (g_orEntry) {
+    lv_obj_t *mark = lv_image_create(scr);
+    lv_image_set_src(mark, &img_or_mark);
+    lv_obj_align(mark, LV_ALIGN_TOP_MID, 0, 40);
+  } else {
+    lv_obj_t *mark = build_claude_mark(scr);
+    lv_obj_align(mark, LV_ALIGN_TOP_MID, 0, 8);
+  }
 
-  lv_obj_t *cap = mklabel(scr, TRS("Cole o token pelo navegador, em:",
-                                   "Paste the token via browser, at:"), &lv_font_montserrat_16, C_MUTED);
+  lv_obj_t *cap = mklabel(scr, g_orEntry ? TRS("Cole a chave do OpenRouter pelo navegador, em:",
+                                               "Paste the OpenRouter key via browser, at:")
+                                     : TRS("Cole o token pelo navegador, em:",
+                                           "Paste the token via browser, at:"), &lv_font_montserrat_16, C_MUTED);
   lv_obj_align(cap, LV_ALIGN_TOP_MID, 0, 108);
 
   String url = String("http://") + WiFi.localIP().toString();
@@ -1478,156 +1522,54 @@ static void fatal_screen(const char *msg) {
   while (1) delay(1000);
 }
 
-// ============================================================
-// Histórico / heatmap
-// ============================================================
-static void hist_push(float h5, float d7) {
-  time_t now = time(nullptr);
-  g_hist[g_histHead].t  = (now > 1000000000L) ? (uint32_t)now : 0;
-  g_hist[g_histHead].h5 = (uint8_t)(h5 + 0.5f);
-  g_hist[g_histHead].d7 = (uint8_t)(d7 + 0.5f);
-  g_histHead = (g_histHead + 1) % HIST_MAX;
-  if (g_histN < HIST_MAX) g_histN++;
-}
-static int hist_idx(int i) { return (g_histHead - g_histN + i + HIST_MAX * 2) % HIST_MAX; }
-
 // dia local (dias desde epoch, corrigido pelo fuso configurado)
 static uint32_t day_key() {
   time_t now = time(nullptr);
   if (now < 1000000000L) return 0;
   return (uint32_t)((now + (long)g_tzOffset * 3600) / 86400);
 }
-// retorna o índice do dia em g_days (cria/rotaciona se preciso) — retorna int
-// em vez de DayHeat* para não tropeçar nos protótipos automáticos do .ino
-static int day_slot(uint32_t dk) {
-  for (int i = 0; i < g_dayN; i++)
-    if (g_days[i].day == dk) return i;
-  if (g_dayN == NDAYS) {              // descarta o mais antigo (array cronológico)
-    memmove(&g_days[0], &g_days[1], sizeof(DayHeat) * (NDAYS - 1));
-    g_dayN--;
-  }
-  int i = g_dayN++;
-  g_days[i].day = dk;
-  memset(g_days[i].burn, 0, sizeof(g_days[i].burn));
-  return i;
-}
 
-// Heatmap: atribui o consumo (Δ utilização 5h) à hora do dia local.
-static void accumulate_heat(float h5) {
-  time_t now = time(nullptr);
-  if (g_lastH5 >= 0 && now > 1000000000L) {
-    float d = h5 - g_lastH5;
-    if (d > 0 && d < 100) {
-      struct tm tmv; localtime_r(&now, &tmv);
-      g_hourBurn[tmv.tm_hour] += d;
-      uint32_t dk = day_key();
-      if (dk) g_days[day_slot(dk)].burn[tmv.tm_hour] += d;
-    }
-  }
-  g_lastH5 = h5;
-}
-
-// soma o heatmap conforme o período escolhido (0=hoje 1=7d 2=30d 3=tudo)
-static void heat_mode_data(int mode, float out[24]) {
-  memset(out, 0, sizeof(float) * 24);
-  if (mode == 3) { memcpy(out, g_hourBurn, sizeof(float) * 24); return; }
-  uint32_t today = day_key();
-  if (!today) return;
-  uint32_t minDay = (mode == 0) ? today : (mode == 1) ? today - 6 : today - 29;
-  for (int i = 0; i < g_dayN; i++) {
-    if (g_days[i].day < minDay || g_days[i].day > today) continue;
-    for (int h = 0; h < 24; h++) out[h] += g_days[i].burn[h];
+// ---- OpenRouter: saldo + gasto do dia ----
+// "Hoje" = total_usage menos o total_usage do 1o poll do dia local (sem endpoint
+// extra). ponytail: so o dia; 7d/30d pediriam GET /api/v1/activity (JSON grande).
+static void or_apply(const OrData &d) {
+  g_or = d;
+  uint32_t dk = day_key();
+  if (dk && (dk != g_orDay || g_orBase < 0 || d.used < g_orBase)) {
+    g_orDay = dk; g_orBase = d.used;
+    g_prefs.putUInt("ordk", dk); g_prefs.putFloat("orbase", d.used);
   }
 }
-
-// Persistência do histórico/heatmap em LittleFS (sobrevive reboot).
-// v2 = v1 + heatmap por dia. Carrega v1 antigo para não perder histórico.
-#define HIST_MAGIC_V1 0xC1A0DE01
-#define HIST_MAGIC_V2 0xC1A0DE02
-#define HIST_MAX_V1 120
-struct HistFileV1 { uint32_t magic; int n, head; Sample hist[HIST_MAX_V1]; float hourBurn[24]; float lastH5; };
-struct HistFileV2 {
-  uint32_t magic; int n, head; Sample hist[HIST_MAX]; float hourBurn[24]; float lastH5;
-  int dayN; DayHeat days[NDAYS];
-};
-static void hist_path(char *out, size_t sz) {
-  snprintf(out, sz, "/hist%d.bin", g_accts.active);
+static float or_today() {
+  return (g_orBase >= 0 && g_orDay && g_orDay == day_key()) ? g_or.used - g_orBase : 0.0f;
 }
-static void reset_history_ram() {
-  memset(g_hist, 0, sizeof(g_hist));
-  g_histN = 0; g_histHead = 0;
-  memset(g_hourBurn, 0, sizeof(g_hourBurn));
-  g_lastH5 = -1.0f;
-  memset(g_days, 0, sizeof(g_days));
-  g_dayN = 0;
-}
-static void save_history() {
-  char pth[16]; hist_path(pth, sizeof(pth));
-  File f = LittleFS.open(pth, "w");
-  if (!f) return;
-  static HistFileV2 hf;                       // grande demais p/ stack
-  hf.magic = HIST_MAGIC_V2; hf.n = g_histN; hf.head = g_histHead;
-  memcpy(hf.hist, g_hist, sizeof(g_hist));
-  memcpy(hf.hourBurn, g_hourBurn, sizeof(g_hourBurn));
-  hf.lastH5 = g_lastH5;
-  hf.dayN = g_dayN;
-  memcpy(hf.days, g_days, sizeof(g_days));
-  f.write((uint8_t *)&hf, sizeof(hf));
-  f.close();
-}
-static void load_history() {
-  char pth[16]; hist_path(pth, sizeof(pth));
-  File f = LittleFS.open(pth, "r");
-  if (!f) return;
-  uint32_t magic = 0;
-  f.read((uint8_t *)&magic, sizeof(magic));
-  f.seek(0);
-  if (magic == HIST_MAGIC_V2) {
-    static HistFileV2 hf;
-    if (f.read((uint8_t *)&hf, sizeof(hf)) == (int)sizeof(hf)) {
-      g_histN = hf.n; g_histHead = hf.head;
-      memcpy(g_hist, hf.hist, sizeof(g_hist));
-      memcpy(g_hourBurn, hf.hourBurn, sizeof(g_hourBurn));
-      g_lastH5 = hf.lastH5;
-      g_dayN = (hf.dayN >= 0 && hf.dayN <= NDAYS) ? hf.dayN : 0;
-      memcpy(g_days, hf.days, sizeof(g_days));
-    }
-  } else if (magic == HIST_MAGIC_V1) {
-    static HistFileV1 hf;
-    if (f.read((uint8_t *)&hf, sizeof(hf)) == (int)sizeof(hf)) {
-      int n = (hf.n > HIST_MAX_V1) ? HIST_MAX_V1 : hf.n;
-      for (int i = 0; i < n; i++)
-        g_hist[i] = hf.hist[(hf.head - n + i + HIST_MAX_V1 * 2) % HIST_MAX_V1];
-      g_histN = n; g_histHead = n % HIST_MAX;
-      memcpy(g_hourBurn, hf.hourBurn, sizeof(g_hourBurn));
-      g_lastH5 = hf.lastH5;
-      Serial.println("[HIST] migrado v1 -> v2");
-    }
+static void or_poll() {
+  if (!g_hasOr) return;
+  if (!g_orKey[0] && !decryptToken(g_orBlob, g_sessionPin, g_orKey, sizeof(g_orKey))) {
+    g_or.ok = false; strlcpy(g_or.error, "chave ilegivel", sizeof(g_or.error));
+    return;
   }
-  f.close();
+  OrData d = {};
+  if (fetchOpenRouter(g_orKey, d)) or_apply(d);
+  else { g_or.ok = false; strlcpy(g_or.error, d.error, sizeof(g_or.error)); }
 }
-
-// Copia byte a byte (o LittleFS nao tem copy). Usada na migracao para multi-conta:
-// /hist.bin vira /hist0.bin mas o original FICA, para que um firmware anterior ao
-// multi-conta (que so conhece /hist.bin) ainda ache o historico se a placa voltar.
-// Custo: ~4,5 KB duplicados numa particao de ~14 MB.
-static bool copy_file(const char *from, const char *to) {
-  File src = LittleFS.open(from, "r");
-  if (!src) return false;
-  File dst = LittleFS.open(to, "w");
-  if (!dst) { src.close(); return false; }
-  uint8_t buf[512];
-  bool ok = true;
-  for (;;) {
-    int n = src.read(buf, sizeof(buf));
-    if (n <= 0) break;
-    if (dst.write(buf, (size_t)n) != (size_t)n) { ok = false; break; }
-  }
-  dst.close();
-  src.close();
-  return ok;
+// Valida no OpenRouter e grava cifrada com o PIN da sessao (tela ou painel web).
+static bool or_save(const char *key, OrData &d) {
+  if (!g_sessionPin[0]) { strlcpy(d.error, "device bloqueado (PIN)", sizeof(d.error)); return false; }
+  if (!fetchOpenRouter(key, d)) return false;
+  if (!encryptToken(key, g_sessionPin, g_orBlob)) { strlcpy(d.error, "falha ao cifrar", sizeof(d.error)); return false; }
+  g_prefs.putBytes("orblob", &g_orBlob, sizeof(g_orBlob));
+  g_hasOr = true;
+  strlcpy(g_orKey, key, sizeof(g_orKey));
+  or_apply(d);
+  Serial.println("[OR] chave salva");
+  return true;
 }
-
+static void or_remove() {
+  g_prefs.remove("orblob"); g_prefs.remove("ordk"); g_prefs.remove("orbase");
+  g_hasOr = false; memset(g_orKey, 0, sizeof(g_orKey)); memset(&g_or, 0, sizeof(g_or));
+  g_orBase = -1.0f; g_orDay = 0;
+}
 static bool switch_account(int slot) {
   if (slot < 0 || slot >= ACCT_MAX || !g_accts.used[slot] || slot == g_accts.active)
     return false;
@@ -1636,13 +1578,10 @@ static bool switch_account(int slot) {
   char tok[200];
   if (!decryptToken(b, g_sessionPin, tok, sizeof(tok))) return false;
 
-  save_history();
   accountSetActive(g_prefs, g_accts, slot);
   g_blob = b;
   strlcpy(g_token, tok, sizeof(g_token));
   memset(tok, 0, sizeof(tok));
-  reset_history_ram();
-  load_history();
   memset(&g_tok, 0, sizeof(g_tok));
   memset(&g_usage, 0, sizeof(g_usage));
   Serial.printf("[ACCT] conta ativa -> slot %d (%s)\n", slot, g_accts.label[slot]);
@@ -1659,14 +1598,11 @@ static void finalize_pending_token() {
   }
   bool replacing = g_accts.used[g_tokenTargetSlot];
   bool switching = (g_tokenTargetSlot != g_accts.active);
-  if (switching) save_history();
   const char *lbl = g_pendingLabel[0] ? g_pendingLabel
                     : (replacing ? g_accts.label[g_tokenTargetSlot] : "");
   accountSave(g_prefs, g_accts, g_tokenTargetSlot, nb, lbl);
   if (switching) {
     accountSetActive(g_prefs, g_accts, g_tokenTargetSlot);
-    reset_history_ram();
-    load_history();
     memset(&g_tok, 0, sizeof(g_tok));
   }
   g_blob = nb;
@@ -1676,7 +1612,6 @@ static void finalize_pending_token() {
   g_hasToken = true;
   g_lastOkMs = g_lastPollMs = millis();
   g_lastFetchOk = true;
-  hist_push(g_usage.h5, g_usage.d7); accumulate_heat(g_usage.h5); save_history();
   Serial.printf("[ACCT] token salvo no slot %d (%s)\n",
                 g_tokenTargetSlot, g_accts.label[g_tokenTargetSlot]);
   request_state(ST_MAIN);
@@ -1958,119 +1893,47 @@ static void build_tile_agora(lv_obj_t *t) {
   lv_obj_set_width(g_ui.agTok, 342);
   lv_obj_set_style_text_align(g_ui.agTok, LV_TEXT_ALIGN_RIGHT, 0);
 }
-// Tile 1 — JANELA 5H: histórico + projeção pontilhada até esgotar.
-#define TR_X0 12
-#define TR_Y0 10
-#define TR_W  440
-#define TR_H  110
-static int tr_x(uint32_t tt, uint32_t ws, uint32_t we) {
-  if (we <= ws) return TR_X0;
-  long long v = (long long)(tt - ws) * TR_W / (long long)(we - ws);
-  if (v < 0) v = 0; if (v > TR_W) v = TR_W;
-  return TR_X0 + (int)v;
+// Tile 1 — OPENROUTER: saldo da conta + gasto do dia (so com chave configurada).
+static void build_tile_or(lv_obj_t *t) {
+  build_win_card(t, 8, TRS("SALDO", "BALANCE"), &g_ui.orBal, g_ui.orSeg, &g_ui.orAt, &g_ui.orFree);
+  lv_obj_t *c = card(t, 244, 4, 228, 194);
+  tstatic(c, TRS("GASTO HOJE", "SPENT TODAY"), &lv_font_montserrat_14, C_MUTED, 0, 0);
+  g_ui.orToday = tlabel(c, &lv_font_montserrat_48, C_TEXT, 0, 20);
+  tstatic(c, TRS("TOTAL GASTO", "TOTAL SPENT"), &lv_font_montserrat_14, C_MUTED, 0, 106);
+  g_ui.orUsed = tlabel(c, &lv_font_montserrat_28, C_TEXT, 0, 128);
+  g_ui.orChip = mkchip(t, 8, 204);
+  g_ui.orMsg = tlabel(t, &lv_font_montserrat_12, C_MUTED, 130, 210);
+  lv_obj_set_width(g_ui.orMsg, 342);
+  lv_obj_set_style_text_align(g_ui.orMsg, LV_TEXT_ALIGN_RIGHT, 0);
 }
-static int tr_y(float p) {
-  if (p < 0) p = 0; if (p > 100) p = 100;
-  return TR_Y0 + TR_H - (int)(p * TR_H / 100.0f);
-}
-static void build_tile_trend(lv_obj_t *t) {
-  tstatic(t, TRS("Janela de 5h", "5-hour window"), &lv_font_montserrat_16, C_TEXT, 14, 2);
-  tstatic(t, TRS("uso real + projecao", "real usage + projection"), &lv_font_montserrat_12, C_FAINT, 320, 6);
+static void or_refresh_ui() {
+  if (!g_ui.orBal) return;
+  char b[64];
+  bool have = g_or.credits > 0 || g_or.used > 0;
+  float bal = g_or.credits - g_or.used;
+  float usedPct = g_or.credits > 0 ? g_or.used * 100.0f / g_or.credits : 100.0f;
+  if (usedPct > 100) usedPct = 100;
+  if (have) snprintf(b, sizeof(b), "$%.2f", bal); else strlcpy(b, "--", sizeof(b));
+  lv_label_set_text(g_ui.orBal, b);
+  lv_obj_set_style_text_color(g_ui.orBal, grad_color(have ? usedPct : 0), 0);
+  set_meter(g_ui.orSeg, have ? usedPct : 0);
+  snprintf(b, sizeof(b), TRS("LIVRE DE $%.2f COMPRADOS", "LEFT OF $%.2f PURCHASED"), g_or.credits);
+  lv_label_set_text(g_ui.orAt, have ? b : "");
+  if (have) snprintf(b, sizeof(b), "%d%%", (int)(100.0f - usedPct + 0.5f)); else strlcpy(b, "", sizeof(b));
+  lv_label_set_text(g_ui.orFree, b);
+  if (have) snprintf(b, sizeof(b), "$%.2f", or_today()); else strlcpy(b, "--", sizeof(b));
+  lv_label_set_text(g_ui.orToday, b);
+  if (have) snprintf(b, sizeof(b), "$%.2f", g_or.used); else strlcpy(b, "--", sizeof(b));
+  lv_label_set_text(g_ui.orUsed, b);
 
-  lv_obj_t *c = card(t, 8, 26, 464, 154);
-  lv_obj_set_style_pad_all(c, 0, 0);
-
-  // grade: 25/50/75%
-  for (int i = 1; i <= 3; i++) {
-    lv_obj_t *g = rrect(c, TR_X0, tr_y(i * 25.0f), TR_W, 1, 0, C_GRID);
-    (void)g;
-  }
-  tstatic(c, "100", &lv_font_montserrat_12, C_FAINT, TR_X0 + TR_W - 24, TR_Y0 - 6);
-  tstatic(c, "0",   &lv_font_montserrat_12, C_FAINT, TR_X0 + TR_W - 10, TR_Y0 + TR_H - 14);
-
-  // histórico (linha sólida coral)
-  g_ui.trHist = lv_line_create(c);
-  lv_obj_set_pos(g_ui.trHist, 0, 0);
-  lv_obj_set_style_line_width(g_ui.trHist, 3, 0);
-  lv_obj_set_style_line_color(g_ui.trHist, lv_color_hex(C_ACCENT), 0);
-  lv_obj_set_style_line_rounded(g_ui.trHist, true, 0);
-
-  // projeção (pontilhada)
-  g_ui.trProj = lv_line_create(c);
-  lv_obj_set_pos(g_ui.trProj, 0, 0);
-  lv_obj_set_style_line_width(g_ui.trProj, 2, 0);
-  lv_obj_set_style_line_color(g_ui.trProj, lv_color_hex(C_ACCENT), 0);
-  lv_obj_set_style_line_opa(g_ui.trProj, 170, 0);
-  lv_obj_set_style_line_dash_width(g_ui.trProj, 6, 0);
-  lv_obj_set_style_line_dash_gap(g_ui.trProj, 6, 0);
-
-  // marcador do ponto atual
-  g_ui.trDot = rrect(c, 0, 0, 8, 8, 4, C_TEXT);
-  lv_obj_add_flag(g_ui.trDot, LV_OBJ_FLAG_HIDDEN);
-
-  // horários do eixo X (início da janela / reset)
-  g_ui.trT0 = tlabel(c, &lv_font_montserrat_12, C_FAINT, TR_X0, TR_Y0 + TR_H + 8);
-  g_ui.trT1 = tlabel(c, &lv_font_montserrat_12, C_FAINT, TR_X0 + TR_W - 40, TR_Y0 + TR_H + 8);
-
-  g_ui.trCap = tlabel(t, &lv_font_montserrat_16, C_MUTED, 14, 194);
-  lv_obj_set_width(g_ui.trCap, 452);
-  lv_label_set_long_mode(g_ui.trCap, LV_LABEL_LONG_WRAP);
-}
-// Tile 2 — RITMO: heatmap por hora com filtro de período.
-static void heat_btn_style() {
-  const char *names[4] = {TRS("Hoje", "Today"), "7d", "30d", TRS("Tudo", "All")};
-  for (int i = 0; i < 4; i++) {
-    if (!g_ui.heatBtn[i]) continue;
-    bool on = (i == g_heatMode);
-    lv_obj_set_style_bg_color(g_ui.heatBtn[i], lv_color_hex(on ? C_ACCENT : C_SURFACE2), 0);
-    lv_obj_t *l = lv_obj_get_child(g_ui.heatBtn[i], 0);
-    if (l) {
-      lv_label_set_text(l, names[i]);
-      lv_obj_set_style_text_color(l, lv_color_hex(on ? C_BG : C_MUTED), 0);
-    }
-  }
-}
-static void heat_btn_cb(lv_event_t *e) {
-  int m = (int)(intptr_t)lv_event_get_user_data(e);
-  if (m == g_heatMode) return;
-  g_heatMode = m;
-  g_prefs.putInt("heatm", m);
-  heat_btn_style();
-  heat_redraw();
-}
-static void build_tile_heat(lv_obj_t *t) {
-  tstatic(t, TRS("Ritmo por hora", "Hourly rhythm"), &lv_font_montserrat_16, C_TEXT, 14, 6);
-  for (int i = 0; i < 4; i++) {
-    lv_obj_t *b = lv_button_create(t);
-    lv_obj_set_size(b, 52, 30);
-    lv_obj_set_pos(b, 246 + i * 56, 0);
-    lv_obj_set_style_radius(b, 15, 0);
-    lv_obj_set_style_shadow_width(b, 0, 0);
-    lv_obj_set_ext_click_area(b, 6);
-    lv_obj_t *l = mklabel(b, "", &lv_font_montserrat_14, C_MUTED);
-    lv_obj_center(l);
-    lv_obj_add_event_cb(b, heat_btn_cb, LV_EVENT_CLICKED, (void *)(intptr_t)i);
-    g_ui.heatBtn[i] = b;
-  }
-  heat_btn_style();
-  for (int h = 0; h < 24; h++) {
-    lv_obj_t *bar = lv_obj_create(t);
-    lv_obj_set_size(bar, 13, 4);
-    lv_obj_set_pos(bar, 18 + h * 18, 176);
-    lv_obj_set_style_radius(bar, 3, 0);
-    lv_obj_set_style_bg_color(bar, lv_color_hex(C_ACCENT), 0);
-    lv_obj_set_style_border_width(bar, 0, 0);
-    lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
-    g_ui.heat[h] = bar;
-  }
-  int ticks[5] = {0, 6, 12, 18, 23};
-  for (int i = 0; i < 5; i++) {
-    int h = ticks[i]; char s[4]; snprintf(s, sizeof(s), "%dh", h);
-    lv_obj_t *l = mklabel(t, s, &lv_font_montserrat_12, C_MUTED);
-    lv_obj_set_pos(l, 14 + h * 18, 186);
-  }
-  tstatic(t, TRS("quota da janela 5h queimada em cada hora local",
-                 "5h-window quota burned per local hour"), &lv_font_montserrat_12, C_FAINT, 14, 214);
+  if (!g_or.ok && g_or.error[0]) set_chip(g_ui.orChip, TRS("ERRO", "ERROR"), C_BAD);
+  else if (!have)                set_chip(g_ui.orChip, "--", C_MUTED);
+  else if (bal <= 0)             set_chip(g_ui.orChip, TRS("SEM SALDO", "NO CREDITS"), C_BAD);
+  else if (usedPct >= 90)        set_chip(g_ui.orChip, TRS("SALDO BAIXO", "LOW BALANCE"), C_WARN);
+  else                           set_chip(g_ui.orChip, "OK", C_OK);
+  lv_label_set_text(g_ui.orMsg, g_or.ok ? TRS("gasto hoje conta a partir do 1o poll do dia",
+                                              "today counts from the day's first poll")
+                                        : g_or.error);
 }
 
 static void on_tile_changed(lv_event_t *e) {
@@ -2083,6 +1946,21 @@ static void on_tile_changed(lv_event_t *e) {
     if (on) g_curTile = i;
     lv_obj_set_style_bg_color(g_ui.dots[i], lv_color_hex(on ? C_ACCENT : C_BORDER), 0);
     lv_obj_set_width(g_ui.dots[i], on ? 18 : 8);
+  }
+  // header segue o provedor do tile visivel
+  bool orTile = g_ui.tile[1] && act == g_ui.tile[1];
+  g_curTile = orTile ? 1 : 0;
+  if (g_ui.hIcon) {
+    lv_image_set_src(g_ui.hIcon, orTile ? &img_or_mark : &img_clawd_sm);
+    lv_obj_set_pos(g_ui.hIcon, 12, orTile ? 13 : 10);
+  }
+  if (g_ui.hOrName) {
+    if (orTile) { lv_obj_add_flag(g_ui.hWord, LV_OBJ_FLAG_HIDDEN); lv_obj_clear_flag(g_ui.hOrName, LV_OBJ_FLAG_HIDDEN); }
+    else        { lv_obj_clear_flag(g_ui.hWord, LV_OBJ_FLAG_HIDDEN); lv_obj_add_flag(g_ui.hOrName, LV_OBJ_FLAG_HIDDEN); }
+  }
+  if (g_ui.hAcct) {                           // @conta e do Claude
+    if (orTile) lv_obj_add_flag(g_ui.hAcct, LV_OBJ_FLAG_HIDDEN);
+    else        lv_obj_clear_flag(g_ui.hAcct, LV_OBJ_FLAG_HIDDEN);
   }
 }
 
@@ -2120,133 +1998,6 @@ static void dash_tick() {
   lv_label_set_text(g_ui.agAt7, b);
 
   set_hdr_status();
-}
-
-// Tendência da janela 5h: histórico + projeção pontilhada até esgotar.
-static void trend_redraw() {
-  if (!g_ui.trHist) return;
-  time_t now = time(nullptr);
-  uint32_t we = g_usage.h5ResetEpoch;
-  bool clockOk = (now > 1000000000L) && we != 0;
-
-  if (!clockOk) {
-    lv_line_set_points(g_ui.trHist, g_trPts, 0);
-    lv_line_set_points(g_ui.trProj, g_trProjPts, 0);
-    lv_obj_add_flag(g_ui.trDot, LV_OBJ_FLAG_HIDDEN);
-    lv_label_set_text(g_ui.trCap, TRS("Aguardando dados da janela...", "Waiting for window data..."));
-    lv_obj_set_style_text_color(g_ui.trCap, lv_color_hex(C_MUTED), 0);
-    return;
-  }
-  uint32_t ws = we - 5 * 3600;
-
-  // horários do eixo
-  char t0[12], t1[12], b[112];
-  fmt_hm(ws, t0, sizeof(t0)); fmt_hm(we, t1, sizeof(t1));
-  lv_label_set_text(g_ui.trT0, t0);
-  lv_label_set_text(g_ui.trT1, t1);
-
-  // pontos do histórico dentro da janela
-  int n = 0;
-  for (int i = 0; i < g_histN && n < HIST_MAX; i++) {
-    Sample s = g_hist[hist_idx(i)];
-    if (s.t == 0 || s.t < ws || s.t > (uint32_t)now) continue;
-    g_trPts[n].x = tr_x(s.t, ws, we);
-    g_trPts[n].y = tr_y(s.h5);
-    n++;
-  }
-  // ponto atual (leitura mais recente)
-  uint32_t nowClamped = ((uint32_t)now > we) ? we : (uint32_t)now;
-  if (n < HIST_MAX) {
-    g_trPts[n].x = tr_x(nowClamped, ws, we);
-    g_trPts[n].y = tr_y(g_usage.h5);
-    n++;
-  }
-  lv_line_set_points(g_ui.trHist, g_trPts, n);
-
-  int cx = tr_x(nowClamped, ws, we), cy = tr_y(g_usage.h5);
-  lv_obj_set_pos(g_ui.trDot, cx - 4, cy - 4);
-  lv_obj_clear_flag(g_ui.trDot, LV_OBJ_FLAG_HIDDEN);
-
-  if (n < 3) {
-    lv_line_set_points(g_ui.trProj, g_trProjPts, 0);
-    lv_label_set_text(g_ui.trCap, TRS("Coletando dados... (~alguns minutos)",
-                                      "Collecting data... (~a few minutes)"));
-    lv_obj_set_style_text_color(g_ui.trCap, lv_color_hex(C_MUTED), 0);
-    return;
-  }
-
-  // taxa: janela dos últimos 45 min
-  float rate = 0;                    // %/min
-  {
-    Sample first = {0, 0, 0};
-    for (int i = 0; i < g_histN; i++) {
-      Sample s = g_hist[hist_idx(i)];
-      if (s.t == 0 || s.t < ws) continue;
-      if (s.t >= (uint32_t)now - 2700) { first = s; break; }
-    }
-    if (first.t != 0 && (uint32_t)now > first.t + 300) {
-      float dt = ((uint32_t)now - first.t) / 60.0f;
-      rate = (g_usage.h5 - first.h5) / dt;
-    }
-  }
-
-  char e[32];
-  if (g_usage.h5 >= 99.5f) {
-    lv_line_set_points(g_ui.trProj, g_trProjPts, 0);
-    fmt_eta(we, e, sizeof(e));
-    snprintf(b, sizeof(b), TRS("Janela esgotada \xE2\x80\xA2 reseta em %s",
-                               "Window exhausted \xE2\x80\xA2 resets in %s"), e);
-    lv_label_set_text(g_ui.trCap, b);
-    lv_obj_set_style_text_color(g_ui.trCap, lv_color_hex(C_BAD), 0);
-  } else if (rate > 0.02f) {
-    float minsLeft = (100.0f - g_usage.h5) / rate;
-    uint32_t etaT = (uint32_t)now + (uint32_t)(minsLeft * 60);
-    g_trProjPts[0].x = cx; g_trProjPts[0].y = cy;
-    if (etaT <= we) {
-      g_trProjPts[1].x = tr_x(etaT, ws, we);
-      g_trProjPts[1].y = tr_y(100);
-      char hm[12]; fmt_hm(etaT, hm, sizeof(hm));
-      snprintf(b, sizeof(b), TRS("No ritmo atual, esgota as %s (em %dh%02dm)",
-                                 "At this pace, runs out at %s (in %dh%02dm)"),
-               hm, (int)minsLeft / 60, (int)minsLeft % 60);
-      lv_label_set_text(g_ui.trCap, b);
-      lv_obj_set_style_text_color(g_ui.trCap, lv_color_hex(minsLeft < 60 ? C_BAD : C_WARN), 0);
-    } else {
-      float endPct = g_usage.h5 + rate * ((we - (uint32_t)now) / 60.0f);
-      g_trProjPts[1].x = tr_x(we, ws, we);
-      g_trProjPts[1].y = tr_y(endPct);
-      snprintf(b, sizeof(b), TRS("No ritmo atual, NAO esgota antes do reset (~%d%%)",
-                                 "At this pace, does NOT run out before reset (~%d%%)"),
-               (int)(endPct + 0.5f));
-      lv_label_set_text(g_ui.trCap, b);
-      lv_obj_set_style_text_color(g_ui.trCap, lv_color_hex(C_OK), 0);
-    }
-    lv_line_set_points(g_ui.trProj, g_trProjPts, 2);
-  } else {
-    lv_line_set_points(g_ui.trProj, g_trProjPts, 0);
-    lv_label_set_text(g_ui.trCap, TRS("Uso estavel \xE2\x80\xA2 sem risco no momento",
-                                      "Stable usage \xE2\x80\xA2 no risk right now"));
-    lv_obj_set_style_text_color(g_ui.trCap, lv_color_hex(C_OK), 0);
-  }
-}
-
-static void heat_redraw() {
-  if (!g_ui.heat[0]) return;
-  float data[24];
-  heat_mode_data(g_heatMode, data);
-  float mx = 1.0f;
-  for (int h = 0; h < 24; h++) if (data[h] > mx) mx = data[h];
-  int curHour = -1; time_t now = time(nullptr);
-  if (now > 1000000000L) { struct tm tv; localtime_r(&now, &tv); curHour = tv.tm_hour; }
-  for (int h = 0; h < 24; h++) {
-    if (!g_ui.heat[h]) continue;
-    float r = data[h] / mx; if (r < 0) r = 0; if (r > 1) r = 1;
-    int hgt = 4 + (int)(r * 114);
-    lv_obj_set_size(g_ui.heat[h], 13, hgt);
-    lv_obj_set_y(g_ui.heat[h], 176 - hgt);
-    lv_obj_set_style_bg_color(g_ui.heat[h], lv_color_hex(h == curHour ? C_TEXT : C_ACCENT), 0);
-    lv_obj_set_style_bg_opa(g_ui.heat[h], (lv_opa_t)(70 + (int)(r * 185)), 0);
-  }
 }
 
 // ============================================================
@@ -2481,9 +2232,8 @@ static void refresh_ui_values() {
 
   set_chip(g_ui.agChip, overall_label(g_usage.statusOverall), status_color(g_usage.statusOverall));
   update_tok_row();
+  or_refresh_ui();
 
-  trend_redraw();
-  heat_redraw();
   dash_tick();
 }
 
@@ -2510,7 +2260,9 @@ static void ui_main() {
   lv_obj_t *hIcon = lv_image_create(scr);
   lv_image_set_src(hIcon, &img_clawd_sm);
   lv_obj_set_pos(hIcon, 12, 10);               // 58x36 num header de 56px
+  g_ui.hIcon = hIcon;
   lv_obj_t *hWord = lv_image_create(scr);
+  g_ui.hWord = hWord;
   int logoEnd, badgeEnd;
   if (logo_present()) {
     // Slot de parceiro preenchido: sem wordmark; o logo fica centrado no header,
@@ -2524,6 +2276,12 @@ static void ui_main() {
     lv_obj_set_pos(hWord, 80, 10);
     logoEnd = 80 + 78;                         // wordmark 78x36
     badgeEnd = 300;
+    if (g_hasOr) {                             // nome do tile OpenRouter (sem logo de parceiro)
+      g_ui.hOrName = lv_image_create(scr);     // nome "openrouter" 114x22 ao lado do simbolo
+      lv_image_set_src(g_ui.hOrName, &img_or_text);
+      lv_obj_set_pos(g_ui.hOrName, 62, 17);
+      lv_obj_add_flag(g_ui.hOrName, LV_OBJ_FLAG_HIDDEN);
+    }
   }
 
   lv_obj_t *logoSpot = lv_obj_create(scr);     // hotspot icone+nome (so demo)
@@ -2537,6 +2295,7 @@ static void ui_main() {
     static uint32_t lastClick = 0;             // duplo clique manual (9.2 nao tem nativo)
     static int di = 0;
     uint32_t now = millis();
+    if (g_curTile != 0) return;                // demo e do Claude
     if (now - lastClick < 450) {
       static const int T[4] = {25, 50, 70, 100};
       show_moment((di / 4) % 2, T[di % 4]);
@@ -2569,6 +2328,7 @@ static void ui_main() {
     lv_obj_set_width(acct, badgeEnd - acctX);
     lv_label_set_long_mode(acct, LV_LABEL_LONG_DOT);
     lv_obj_align(acct, LV_ALIGN_TOP_LEFT, acctX, 22);
+    g_ui.hAcct = acct;
   }
 
   lv_obj_t *gear = mkbtn(scr, LV_SYMBOL_SETTINGS, &lv_font_montserrat_22, C_SURFACE2, C_TEXT);
@@ -2597,24 +2357,24 @@ static void ui_main() {
   lv_obj_set_style_bg_opa(g_ui.tv, 0, 0);
   lv_obj_set_style_border_width(g_ui.tv, 0, 0);
   lv_obj_set_scrollbar_mode(g_ui.tv, LV_SCROLLBAR_MODE_OFF);
-  for (int i = 0; i < NTILES; i++) {
+  const int nt = g_hasOr ? 2 : 1;
+  for (int i = 0; i < nt; i++) {
     g_ui.tile[i] = lv_tileview_add_tile(g_ui.tv, i, 0, LV_DIR_HOR);
     tile_setup(g_ui.tile[i]);
   }
   build_tile_agora(g_ui.tile[0]);
-  build_tile_trend(g_ui.tile[1]);
-  build_tile_heat(g_ui.tile[2]);
+  if (g_hasOr) build_tile_or(g_ui.tile[1]);
   lv_obj_add_event_cb(g_ui.tv, on_tile_changed, LV_EVENT_VALUE_CHANGED, NULL);
 
-  // Dots (objetos; o ativo vira pílula)
-  for (int i = 0; i < NTILES; i++) {
+  // Dots (objetos; o ativo vira pílula) — so com mais de um tile
+  for (int i = 0; i < nt && nt > 1; i++) {
     g_ui.dots[i] = lv_obj_create(scr);
     lv_obj_set_size(g_ui.dots[i], 8, 8);
     lv_obj_set_style_radius(g_ui.dots[i], 4, 0);
     lv_obj_set_style_bg_color(g_ui.dots[i], lv_color_hex(C_BORDER), 0);
     lv_obj_set_style_border_width(g_ui.dots[i], 0, 0);
     lv_obj_clear_flag(g_ui.dots[i], LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_align(g_ui.dots[i], LV_ALIGN_BOTTOM_MID, (int)((i - (NTILES - 1) / 2.0f) * 18), -4);
+    lv_obj_align(g_ui.dots[i], LV_ALIGN_BOTTOM_MID, (int)((i - (nt - 1) / 2.0f) * 18), -4);
   }
 
   refresh_ui_values();
@@ -2625,6 +2385,8 @@ static void ui_main() {
 // Tela: settings (lista rolável; linhas >=44px de toque)
 // ============================================================
 static bool g_wipeArmed = false;
+static bool g_orDelArmed = false;
+static lv_obj_t *g_orLbl = nullptr;
 static lv_obj_t *g_briLbl = nullptr, *g_wipeLbl = nullptr, *g_pollLbl = nullptr,
                 *g_tzLbl = nullptr, *g_slideLbl = nullptr;
 static const int POLL_OPTS[] = {15, 30, 60, 120, 300};
@@ -2754,6 +2516,19 @@ static void settings_action_cb(lv_event_t *e) {
       g_prefs.putBool("night", g_nightOn);
       if (g_nightLbl) { char m[80]; night_txt(m, sizeof(m)); lv_label_set_text(g_nightLbl, m); }
       break;
+    case 16:                                           // OpenRouter: conectar / remover (2 toques)
+      if (!g_hasOr) {
+        g_orEntry = true;
+        request_state(ST_TOKEN);
+      } else if (!g_orDelArmed) {
+        g_orDelArmed = true;
+        if (g_orLbl) lv_label_set_text(g_orLbl, TRS(LV_SYMBOL_CLOSE "  OpenRouter: toque de novo p/ remover",
+                                                   LV_SYMBOL_CLOSE "  OpenRouter: tap again to remove"));
+      } else {
+        or_remove();
+        request_state(ST_SETTINGS);
+      }
+      break;
     case 13:                                           // abre janela de OTA (5 min)
       g_otaUntil = millis() + OTA_WINDOW_MS;
       if (!g_otaUntil) g_otaUntil = 1;                 // 0 e o sentinela de "fechado"
@@ -2782,6 +2557,7 @@ static void add_setting_row(lv_obj_t *p, const char *txt, int act, uint32_t fg, 
 static void ui_settings() {
   lv_obj_t *scr = lv_screen_active();
   g_wipeArmed = false;
+  g_orDelArmed = false;
   start_data_web();
   lv_obj_t *title = mklabel(scr, TRS("Ajustes", "Settings"), &lv_font_montserrat_20, C_TEXT);
   lv_obj_align(title, LV_ALIGN_TOP_LEFT, 14, 10);
@@ -2841,6 +2617,9 @@ static void ui_settings() {
                                          LV_SYMBOL_DIRECTORY "  Accounts: %s (%d/%d)"),
            g_accts.label[g_accts.active], accountCount(g_accts), ACCT_MAX);
   add_setting_row(lst, acctTxt,                                 11, C_TEXT, nullptr);
+  add_setting_row(lst, g_hasOr ? TRS(LV_SYMBOL_OK "  OpenRouter: conectado", LV_SYMBOL_OK "  OpenRouter: connected")
+                               : TRS(LV_SYMBOL_PLUS "  OpenRouter: conectar", LV_SYMBOL_PLUS "  OpenRouter: connect"),
+                  16, C_TEXT, &g_orLbl);
   add_setting_row(lst, TRS(LV_SYMBOL_KEYBOARD "  Trocar token",
                            LV_SYMBOL_KEYBOARD "  Change token"), 2, C_TEXT, nullptr);
   add_setting_row(lst, TRS(LV_SYMBOL_UPLOAD "  Atualizar firmware (WiFi)",
@@ -2868,8 +2647,6 @@ static void acct_del_cb(lv_event_t *e) {
   g_acctDelArmed = -1;
   bool wasActive = (slot == g_accts.active);
   accountRemove(g_prefs, g_accts, slot);
-  char pth[16]; snprintf(pth, sizeof(pth), "/hist%d.bin", slot);
-  LittleFS.remove(pth);
   if (wasActive) {
     EncryptedBlob b; char tok[200];
     if (accountLoadBlob(g_prefs, g_accts.active, b) &&
@@ -2877,8 +2654,6 @@ static void acct_del_cb(lv_event_t *e) {
       g_blob = b;
       strlcpy(g_token, tok, sizeof(g_token));
       memset(tok, 0, sizeof(tok));
-      reset_history_ram();
-      load_history();
       memset(&g_tok, 0, sizeof(g_tok));
       memset(&g_usage, 0, sizeof(g_usage));
       request_state(ST_LOADING);
@@ -3102,6 +2877,7 @@ static void nav_cb(lv_event_t *e) {
 // ============================================================
 static void render_state() {
   g_state = g_pending;
+  if (g_state != ST_TOKEN) g_orEntry = false;
   stop_web();                                 // cada tela sobe o servidor que precisa
   moment_close();                             // overlay vive em lv_layer_top
   lv_obj_clean(lv_layer_top());
@@ -3112,7 +2888,7 @@ static void render_state() {
   g_pinDots = g_pinMsg = nullptr;
   g_tokMsg = nullptr;
   g_nameTa = nullptr;
-  g_briLbl = g_wipeLbl = g_pollLbl = g_tzLbl = g_slideLbl = g_wkMascLbl = g_otaSetLbl = g_dimLbl = g_nightLbl = nullptr;
+  g_briLbl = g_wipeLbl = g_pollLbl = g_tzLbl = g_slideLbl = g_wkMascLbl = g_otaSetLbl = g_dimLbl = g_nightLbl = g_orLbl = nullptr;
 
   lv_obj_clean(lv_screen_active());
   lv_obj_set_style_bg_color(lv_screen_active(), lv_color_hex(C_BG), 0);
@@ -3166,9 +2942,9 @@ static void do_refresh() {
   bool ok = fetchUsage(g_token, g_usage);
   if (ok) {
     g_lastOkMs = millis(); g_lastFetchOk = true;
-    hist_push(g_usage.h5, g_usage.d7); accumulate_heat(g_usage.h5); save_history();
     check_thresholds();
   } else g_lastFetchOk = false;
+  or_poll();
   apiClose();                   // libera o contexto TLS (~40KB) entre polls
   log_mem("refresh");
   g_lastPollMs = millis();
@@ -3188,9 +2964,9 @@ static void bg_refresh() {
   bool ok = fetchUsage(g_token, u);
   if (ok) {
     g_usage = u; g_lastOkMs = millis(); g_lastFetchOk = true;
-    hist_push(u.h5, u.d7); accumulate_heat(u.h5); save_history();
     check_thresholds();
   } else g_lastFetchOk = false;
+  or_poll();
   apiClose();                   // libera o contexto TLS (~40KB) entre polls
   log_mem("bg_refresh");
   g_refreshing = false;
@@ -3356,20 +3132,12 @@ void setup() {
 
   if (!LittleFS.begin(true)) Serial.println("LittleFS: falhou");
   else {
-    // Migracao para multi-conta, feita em DOIS passos de proposito: copia para um
-    // .tmp e so entao renomeia. Se faltar energia no meio, o que sobra e um .tmp
-    // truncado — /hist0.bin ainda nao existe, entao o proximo boot refaz a
-    // migracao. Copiar direto para o destino final deixaria um /hist0.bin pela
-    // metade que a guarda "exists" tomaria por migracao concluida.
-    // O /hist.bin original nunca e apagado (rollback p/ firmware anterior).
-    if (LittleFS.exists("/hist.bin") && !LittleFS.exists("/hist0.bin")) {
-      LittleFS.remove("/hist0.tmp");                       // sobra de tentativa anterior
-      bool ok = copy_file("/hist.bin", "/hist0.tmp") &&
-                LittleFS.rename("/hist0.tmp", "/hist0.bin");
-      if (!ok) LittleFS.remove("/hist0.tmp");
-      Serial.printf("[HIST] migrando p/ multi-conta: %s\n", ok ? "ok" : "FALHOU");
+    // Historico/heatmap sairam na v2.5: libera os arquivos antigos.
+    LittleFS.remove("/hist.bin"); LittleFS.remove("/hist0.tmp");
+    for (int i = 0; i < ACCT_MAX; i++) {
+      char pth[16]; snprintf(pth, sizeof(pth), "/hist%d.bin", i);
+      LittleFS.remove(pth);
     }
-    load_history();
     load_web_logo();
   }
 
@@ -3410,7 +3178,8 @@ void loop() {
     g_web->handleClient();
     if (g_state == ST_TOKEN && g_tokenGot) {
       g_tokenGot = false;
-      if (g_onboarding || !g_sessionPin[0]) request_state(ST_SETUP_PIN);
+      if (g_orEntry) request_state(ST_MAIN);
+      else if (g_onboarding || !g_sessionPin[0]) request_state(ST_SETUP_PIN);
       else finalize_pending_token();
     }
   }
@@ -3501,7 +3270,7 @@ void loop() {
     if (g_slideSec > 0 && g_ui.tv && !g_refreshing && !g_mo.scrim &&
         now - g_lastTouchMs > 10000 && now - g_lastSlideMs > (uint32_t)g_slideSec * 1000) {
       g_lastSlideMs = now;
-      int next = (g_curTile + 1) % NTILES;
+      int next = (g_curTile + 1) % (g_hasOr ? 2 : 1);
       lv_tileview_set_tile_by_index(g_ui.tv, next, 0, LV_ANIM_ON);
     }
 

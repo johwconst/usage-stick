@@ -7,7 +7,7 @@
 // ============================================================
 
 // ── Firmware ─────────────────────────────────────────────
-#define FW_VERSION              "2.4"
+#define FW_VERSION              "2.5"
 
 // ── Display QSPI (AXS15231B) ─────────────────────────────
 #define TFT_CS    45
@@ -50,6 +50,7 @@
 #define MESSAGES_ENDPOINT       "https://api.anthropic.com/v1/messages"
 #define ANTHROPIC_VERSION       "2023-06-01"
 #define PROBE_MODEL             "claude-haiku-4-5-20251001"
+#define OR_CREDITS_ENDPOINT     "https://openrouter.ai/api/v1/credits"
 
 // NTP (necessário para os contadores de reset)
 #define NTP_SERVER_1            "pool.ntp.org"

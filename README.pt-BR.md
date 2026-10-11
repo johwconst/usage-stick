@@ -9,7 +9,7 @@ Sem computador. Sem app. Sem nuvem.
 
 [English](README.md) · **Português**
 
-<img src="https://img.shields.io/badge/firmware-v2.4-D97757?style=for-the-badge" alt="firmware v2.4">
+<img src="https://img.shields.io/badge/firmware-v2.5-D97757?style=for-the-badge" alt="firmware v2.5">
 <img src="https://img.shields.io/badge/ESP32--S3-AXS15231B%20480×320-1A1A20?style=for-the-badge" alt="ESP32-S3 AXS15231B">
 <img src="https://img.shields.io/badge/LVGL-9.2.2-4ADE80?style=for-the-badge" alt="LVGL 9.2.2">
 <img src="https://img.shields.io/badge/contas-até%204-8C8C98?style=for-the-badge" alt="até 4 contas">
@@ -19,8 +19,9 @@ Sem computador. Sem app. Sem nuvem.
 </div>
 
 O device consulta a API da Anthropic diretamente, lê o seu uso dos próprios cabeçalhos da resposta
-e desenha tudo num painel — mascotes **Clawd** animados, projeção de consumo, mapa de calor por
-hora do dia, relógios de reset e **até 4 contas** que você alterna na própria tela.
+e desenha tudo num painel — mascotes **Clawd** animados, relógios de reset e **até 4 contas** que
+você alterna na própria tela. Opcionalmente mostra também o saldo e o gasto do **OpenRouter** numa
+segunda tela.
 
 > Navegação 100% touch (swipe ← → entre as telas, sem botão físico). Adaptado do projeto original
 > **Claude Usage Stick** (um firmware multi-placa com botões físicos) para rodar **só nesta
@@ -64,8 +65,9 @@ Se você se vira bem num terminal, pule isso e vá para [Compilar e gravar](#com
 ## Telas
 
 > As imagens abaixo são **mockups fiéis ao pixel**, renderizados a partir do próprio layout e da
-> paleta do firmware (fotos reais do device em breve). Correspondem à v2.4, exceto que as três telas de swipe não
-> mostram o selo `@label` da conta, que aparece no cabeçalho quando você adiciona a segunda.
+> paleta do firmware (fotos reais do device em breve). Correspondem à v2.4, exceto que as telas de swipe não
+> mostram o selo `@label` da conta, que aparece no cabeçalho quando você adiciona a segunda. As telas
+> Janela de 5h e Ritmo por hora saíram na v2.5.
 
 Navegue por **swipe** (os pontinhos embaixo mostram onde você está; o ativo vira uma pílula). A
 **engrenagem** abre os Ajustes. A **barra coral fina** abaixo do cabeçalho escoa até o próximo
@@ -84,23 +86,21 @@ refresh — tocar nela atualiza na hora.
 
 <br clear="right">
 
-### 2. Janela de 5h
-<img src="assets/mock-janela5h.png" width="400" align="right" alt="Tela Janela de 5h">
+### 2. OpenRouter (opcional)
 
-- Gráfico próprio com o **eixo X cobrindo exatamente a janela de 5 h atual** (início → reset).
-- Linha coral sólida = histórico real de uso; **linha pontilhada = projeção** no ritmo atual.
-- Veredito em linguagem simples, com cor: *"No ritmo atual, acaba as 16:40 (em 1h32m)"* (âmbar ou
-  vermelho) ou *"NAO acaba antes do reset (~62%)"* (verde).
+Aparece como segunda tela de swipe quando você conecta uma chave do OpenRouter (Ajustes →
+**OpenRouter**). Com ela visível, o cabeçalho troca o Clawd + logotipo pela logo do OpenRouter.
 
-<br clear="right">
+- Card **Saldo**: saldo da conta (`total_credits - total_usage`) com o mesmo medidor segmentado,
+  colorido pelo quanto do crédito comprado já foi gasto, e o % que resta.
+- **Gasto hoje** e **total gasto**. O "hoje" é calculado no device: o total no primeiro poll do dia
+  local vira a base, então o primeiro dia só conta a partir de quando a chave foi adicionada.
+- Chip de status: `OK` / `SALDO BAIXO` (≥ 90 % gasto) / `SEM SALDO` / `ERRO`.
 
-### 3. Ritmo por hora
-<img src="assets/mock-ritmo.png" width="400" align="right" alt="Tela Ritmo por hora">
-
-- **Uso por hora do dia**: 24 barras cuja altura e brilho mostram quais horas queimam mais quota; a
-  hora atual fica destacada.
-- **Seletor de período** no topo: **Hoje / 7d / 30d / Tudo**. O histórico por dia é **persistido em
-  flash** (31 dias no device).
+O device chama `GET https://openrouter.ai/api/v1/credits`, que só aceita **management key** (crie
+em `openrouter.ai/settings/management-keys`); chave comum de inferência é recusada com erro claro.
+A chave é cifrada com o mesmo PIN do token Claude e consultada no mesmo ciclo de atualização. Dois
+toques na linha removem a chave.
 
 <br clear="right">
 
@@ -137,6 +137,8 @@ Abertos pela engrenagem (lista rolável, linhas de toque de 44 px):
 - **Contas** — até 4 contas Claude (por exemplo pessoal + trabalho); toque num slot para trocar qual
   delas o device monitora, adicione pelo formulário web (com um rótulo próprio), renomeie na tela
   (lápis), remova com 2 toques.
+- **OpenRouter** — conecta uma management key pelo formulário web (adiciona a tela do OpenRouter);
+  quando conectado, 2 toques removem.
 - **Trocar token** — reabre a entrada de token pela web (substitui o token da conta ativa).
 - **Idioma** — português / inglês, aplicado a toda a interface (salvo na NVS).
 - **Sobre** — informações do device, modelo da tela e créditos.
@@ -149,7 +151,7 @@ Tem uma assinatura Claude pessoal **e** uma do trabalho? O device guarda **até 
 rótulo e seu slot criptografado, todas atrás do mesmo PIN.
 
 - **Toque numa linha para trocar.** A ativa fica coral e marcada como *ativa*. A troca substitui o
-  token e o histórico/mapa de calor daquela conta, e atualiza na hora — sem pedir o PIN, porque a
+  token e atualiza na hora — sem pedir o PIN, porque a
   sessão já destravou.
 - **Só a conta ativa é consultada.** As outras ficam completamente dormentes: **zero requisições à
   API**. Isso importa numa conta corporativa, onde cada consulta é visível para os admins da sua
@@ -307,8 +309,8 @@ python3 tools/token_bridge.py --account Pessoal --loop 120    # máquina pessoal
 
 O device guarda até **4 contas** (rótulo + token), cada uma criptografada no seu próprio slot da
 NVS com o mesmo PIN. Só a conta **ativa** é consultada — as outras ficam dormentes, gerando **zero
-tráfego de API**. Trocar (Ajustes → Contas) leva dois toques: o device descriptografa o slot, troca
-o histórico/mapa de calor da conta (`/hist0.bin`..`/hist3.bin` no LittleFS) e atualiza na hora. O
+tráfego de API**. Trocar (Ajustes → Contas) leva dois toques: o device descriptografa o slot e
+atualiza na hora. O
 cabeçalho do painel mostra um selo `@rótulo` sempre que existe mais de uma conta.
 
 Atenção para contas corporativas: cada consulta é uma requisição real (mínima) à API, visível para
@@ -454,7 +456,6 @@ mesmo PIN — sem pedir o PIN de novo durante a sessão.
   significa que a tag GCM não confere.
 - Depois de 10 tentativas erradas, as credenciais são **apagadas** e o device volta ao onboarding
   (cada falha dobra o tempo de bloqueio).
-- O histórico/mapa de calor vive num arquivo **LittleFS**, um por conta (ele não contém o token).
 - O PIN fica na RAM durante a sessão para que trocar de conta não peça de novo. Isso não enfraquece
   o modelo: o token ativo já está descriptografado na RAM de qualquer forma. Nada é escrito na NVS,
   e um reset de fábrica limpa tudo.
