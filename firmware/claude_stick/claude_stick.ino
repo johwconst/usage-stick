@@ -36,7 +36,7 @@
 #include "partner_slot.h"   // logo de parceiro: slot gravado no .bin pelo tools/partner_logo.py
 
 // ---- Paleta (escuro, minimalista; acento coral do Claude) ----
-#define C_BG       0x0F0F12
+#define C_BG       0x000000
 #define C_SURFACE  0x1A1A20   // cards sem borda
 #define C_SURFACE2 0x24242C   // teclas / botoes secundarios
 #define C_TRACK    0x26262E   // trilho de barras
@@ -817,7 +817,7 @@ static const char OTA_CLOSED[] = "OTA fechado. No device: Ajustes > Atualizar fi
 static const char OTA_PAGE[] PROGMEM =
   "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
   "<title>Claude Usage Stick - OTA</title>"
-  "<body style='font-family:sans-serif;background:#0f0f12;color:#f2f0ec;max-width:420px;margin:40px auto'>"
+  "<body style='font-family:sans-serif;background:#000000;color:#f2f0ec;max-width:420px;margin:40px auto'>"
   "<h2>Atualizar firmware</h2>"
   "<p>Envie o <code>claude_stick.ino.bin</code>. O device reinicia sozinho e volta ao dashboard.</p>"
   "<form method=POST action=/update enctype=multipart/form-data>"
@@ -901,7 +901,7 @@ static lv_obj_t *build_claude_mark(lv_obj_t *parent) {
 
 // ---- páginas HTML ----
 #define WEB_CSS \
-  ":root{--bg:#0F0F12;--card:#1A1A20;--bd:#30303A;--tx:#F2F0EC;--mut:#8C8C98;--cor:#D97757}" \
+  ":root{--bg:#000000;--card:#1A1A20;--bd:#30303A;--tx:#F2F0EC;--mut:#8C8C98;--cor:#D97757}" \
   "*{box-sizing:border-box}" \
   "body{margin:0;background:var(--bg);color:var(--tx);font-family:-apple-system,Segoe UI,Roboto,sans-serif;" \
   "display:flex;min-height:100vh;align-items:center;justify-content:center}" \
@@ -1063,7 +1063,7 @@ static void handleTokensPost() {
 static const char PANEL_PAGE[] PROGMEM = R"HTML(<!doctype html><html lang=pt><head><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1"><title>Claude Usage Stick</title>
 <style>
-:root{--bg:#0F0F12;--card:#1A1A20;--bd:#30303A;--tx:#F2F0EC;--mut:#8C8C98;--cor:#D97757;--ok:#4ADE80;--warn:#FBBF24;--bad:#F87171}
+:root{--bg:#000000;--card:#1A1A20;--bd:#30303A;--tx:#F2F0EC;--mut:#8C8C98;--cor:#D97757;--ok:#4ADE80;--warn:#FBBF24;--bad:#F87171}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--tx);font-family:-apple-system,Segoe UI,Roboto,sans-serif;padding:18px}
 main{max-width:760px;margin:auto}h1{font-size:20px;margin:0 0 4px}.sub{color:var(--mut);font-size:13px;margin-bottom:16px}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:12px}.card{background:var(--card);border:1px solid var(--bd);border-radius:16px;padding:18px;margin-bottom:12px}
@@ -1099,7 +1099,7 @@ label{display:block;color:var(--mut);font-size:13px;margin:10px 0 4px}select{wid
 <div class=grid><button id=orsave type=button>Conectar</button><button id=ordel type=button style="background:#24242C;color:#F2F0EC">Remover</button></div>
 <div id=ormsg class=cd>Crie a chave em openrouter.ai/settings/management-keys (a chave comum de API nao le o saldo).</div></div>
 <div class=card><div class=lbl>LOGO DO HEADER</div><div class=cd id=lgst></div>
-<canvas id=lgc width=0 height=0 style="background:#0F0F12;border-radius:6px;margin-top:10px;max-width:100%"></canvas>
+<canvas id=lgc width=0 height=0 style="background:#000000;border-radius:6px;margin-top:10px;max-width:100%"></canvas>
 <input type=file id=lgf accept="image/png,image/svg+xml,image/jpeg,image/webp"><div class=grid>
 <button id=lgup type=button>Enviar logo</button><button id=lgdel type=button style="background:#24242C;color:#F2F0EC">Remover logo</button>
 </div><div id=lgmsg class=cd></div></div>
